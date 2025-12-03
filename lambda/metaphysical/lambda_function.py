@@ -11,7 +11,7 @@ from lasotuvi.DiaBan import diaBan as DiaBanClass
 from lasotuvi.ThienBan import lapThienBan
 
 # IMPORT CÁC CONSTANTS & PROMPTS
-# Lưu ý: Đảm bảo file constants.py có DYNAMODB_TABLE_NAME
+# Lưu ý: LLM_MODEL_ID đã được update thành Nova Pro trong file constants.py
 from constants import (
     BEDROCK_REGION, LLM_MODEL_ID, DYNAMODB_TABLE_NAME
 )
@@ -42,60 +42,24 @@ def get_db_item(category, entity_name):
             print(f"WARN: Item not found for {category} - {entity_name}")
             return {}
         
-        # Parse trường contexts từ JSON string sang Dict
-        # Trong results.csv, cột contexts là chuỗi JSON
         contexts_str = item.get('contexts', '{}')
         if isinstance(contexts_str, str):
             try:
                 return json.loads(contexts_str)
             except json.JSONDecodeError:
-                # Fallback nếu chuỗi không đúng định dạng JSON
                 return {}
-        return contexts_str # Nếu đã là dict (trường hợp lưu dạng Map)
+        return contexts_str 
     except Exception as e:
         print(f"Error getting item from DynamoDB: {str(e)}")
         return {}
 
 def call_bedrock_llm(prompt, temperature=0.5):
-    """Gửi prompt tới Amazon Nova Pro trên Bedrock"""
+    """Gửi prompt tới Model (Cấu hình trong constants.py)"""
     
-    # =========================================================
-    # CŨ: CLAUDE 3 SONNET (Đã comment lại để backup)
-    # =========================================================
-    # body = json.dumps({
-    #     "anthropic_version": "bedrock-2023-05-31",
-    #     "max_tokens": 2000,
-    #     "messages": [
-    #         {
-    #             "role": "user",
-    #             "content": prompt
-    #         }
-    #     ],
-    #     "temperature": temperature,
-    #     "top_p": 0.9
-    # })
-
-    # try:
-    #     response = bedrock_client.invoke_model(
-    #         modelId=LLM_MODEL_ID, # constants.py đang trỏ tới Claude
-    #         body=body
-    #     )
-    #     response_body = json.loads(response.get('body').read())
-    #     return response_body['content'][0]['text']
-    # except Exception as e:
-    #     print(f"Error calling Bedrock (Claude): {str(e)}")
-    #     return "Xin lỗi, hệ thống AI đang bận."
-
-    # =========================================================
-    # MỚI: AMAZON NOVA PRO
-    # =========================================================
-    # ID của Nova Pro: amazon.nova-pro-v1:0
-    nova_model_id = "amazon.nova-pro-v1:0"
-
-    # Cấu trúc Body chuẩn của Amazon Nova
+    # Cấu trúc Body chuẩn của Amazon Nova Pro
     body = json.dumps({
         "inferenceConfig": {
-            "max_new_tokens": 2000,  # Nova dùng max_new_tokens thay vì max_tokens
+            "max_new_tokens": 2000, 
             "temperature": temperature,
             "top_p": 0.9
         },
@@ -103,7 +67,7 @@ def call_bedrock_llm(prompt, temperature=0.5):
             {
                 "role": "user",
                 "content": [
-                    {"text": prompt} # Nova yêu cầu content là list of dicts
+                    {"text": prompt} 
                 ]
             }
         ]
@@ -111,25 +75,22 @@ def call_bedrock_llm(prompt, temperature=0.5):
 
     try:
         response = bedrock_client.invoke_model(
-            modelId=nova_model_id,
+            modelId=LLM_MODEL_ID, # <--- SỬ DỤNG BIẾN TỪ CONSTANTS
             body=body
         )
         response_body = json.loads(response.get('body').read())
         
-        # Cách parse response của Nova: output -> message -> content -> text
+        # Parse response của Nova: output -> message -> content -> text
         return response_body['output']['message']['content'][0]['text']
 
     except Exception as e:
-        print(f"Error calling Bedrock (Nova Pro): {str(e)}")
-        # Fallback hoặc trả lỗi chi tiết hơn để debug
+        print(f"Error calling Bedrock ({LLM_MODEL_ID}): {str(e)}")
         return "Xin lỗi, Vũ trụ Nova đang hiệu chỉnh năng lượng. Vui lòng thử lại sau."
 
 def parse_date(date_str):
-    """Xử lý ngày tháng thông minh, chấp nhận nhiều định dạng"""
     if not date_str:
         return None
     s = str(date_str)
-    # Chuẩn hóa các ký tự lạ về '-'
     s = s.replace('–', '-').replace('—', '-').replace('.', '-').replace('/', '-')
     s = s.strip()
     
@@ -148,7 +109,6 @@ def parse_date(date_str):
 
 # --- ASTROLOGY (CHIÊM TINH) ---
 def calculate_zodiac(day, month):
-    # Logic Hardcoded chính xác từ VPC version
     if (month == 1 and day >= 20) or (month == 2 and day <= 18): return "Bảo Bình"
     if (month == 2 and day >= 19) or (month == 3 and day <= 20): return "Song Ngư"
     if (month == 3 and day >= 21) or (month == 4 and day <= 19): return "Bạch Dương"
@@ -165,7 +125,6 @@ def calculate_zodiac(day, month):
 def format_zodiac_context(zodiac_name, context_json):
     if not context_json:
         return f"Không có dữ liệu chi tiết cho {zodiac_name}."
-    # Trích xuất các trường quan trọng từ context
     return f"""
     - Cung: {zodiac_name}
     - Tính cách: {context_json.get('tinh-cach', '')}
@@ -187,8 +146,6 @@ def handle_astrology(body):
         return "Ngày sinh không hợp lệ."
         
     user_zodiac = calculate_zodiac(user_date.day, user_date.month)
-    
-    # Lấy context từ DynamoDB
     user_zodiac_data = get_db_item('cung-hoang-dao', user_zodiac)
     
     if feature_type == 'overview':
@@ -208,12 +165,9 @@ def handle_astrology(body):
         partner_zodiac = calculate_zodiac(p_date.day, p_date.month)
         partner_zodiac_data = get_db_item('cung-hoang-dao', partner_zodiac)
         
-        # === CẢI TIẾN LOGIC TÌNH YÊU (GOLDEN FEATURE) ===
-        # Trích xuất danh sách cung hợp từ context (chuỗi văn bản)
         u_compatible = user_zodiac_data.get('cung-hop', '')
         p_compatible = partner_zodiac_data.get('cung-hop', '')
         
-        # Kiểm tra chéo đơn giản (string contains)
         is_user_match = partner_zodiac in u_compatible
         is_partner_match = user_zodiac in p_compatible
         
@@ -242,12 +196,10 @@ def handle_astrology(body):
 
 # --- NUMEROLOGY (THẦN SỐ HỌC) ---
 def calculate_life_path(day, month, year):
-    """Tính số chủ đạo, giữ nguyên 11, 22, 33 và 10"""
     full_str = f"{day}{month}{year}"
     total = sum(int(digit) for digit in full_str)
-    
     while total > 9:
-        if total in [11, 22, 33, 10]: # Bao gồm cả 10 như file results.csv
+        if total in [11, 22, 33, 10]:
             break
         total = sum(int(digit) for digit in str(total))
     return str(total)
@@ -263,10 +215,8 @@ def handle_numerology(body):
     life_path = calculate_life_path(user_date.day, user_date.month, user_date.year)
     entity_name = f"Số {life_path}"
     
-    # Lấy data từ DynamoDB
     context_data = get_db_item('numerology_number', entity_name)
     
-    # Format context string
     context_str = f"""
     - Số chủ đạo: {life_path}
     - Tổng quan: {context_data.get('tong-quan', '')}
@@ -292,7 +242,6 @@ def handle_tarot(body):
     if not cards_input:
         return "Vui lòng chọn lá bài."
 
-    # Detect Intent (Logic thông minh từ VPC)
     intent_topic = "general"
     if user_query:
         q_lower = user_query.lower()
@@ -316,19 +265,13 @@ def handle_tarot(body):
         is_upright = card.get('is_upright', True)
         position = card.get('position')
         
-        # Chuẩn hóa tên để query DB (Ví dụ: "the fool" -> "The Fool")
         db_entity_name = raw_name.title() 
-        
-        # 1. Lấy toàn bộ item JSON từ DynamoDB
         card_full_data = get_db_item('tarot_card', db_entity_name)
         
-        # 2. Xử lý "Smart Context" tại code Python (thay vì SQL)
-        # Xác định key cần lấy
         suffix = "upright" if is_upright else "reversed"
-        target_key = f"{intent_topic}_{suffix}" # VD: love_upright
-        backup_key = f"general_{suffix}"        # VD: general_upright
+        target_key = f"{intent_topic}_{suffix}"
+        backup_key = f"general_{suffix}"
         
-        # Lấy nội dung cụ thể từ dict đã parse
         detail_content = card_full_data.get(target_key) or card_full_data.get(backup_key) or "Không có dữ liệu chi tiết."
         
         orientation_str = "Xuôi" if is_upright else "Ngược"
@@ -344,14 +287,12 @@ def handle_tarot(body):
     return call_bedrock_llm(prompt, temperature=0.7)
 
 # --- HOROSCOPE (TỬ VI) ---
-# Logic giữ nguyên từ VPC, trả về JSON Structure
 def parse_time_to_chi(time_str):
     if not time_str: return 12
     try:
         hour = int(str(time_str).split(':')[0])
     except: return 1
-    # Mapping giờ sang Chi (đơn giản hóa)
-    if hour >= 23 or hour < 1: return 1 # Tý
+    if hour >= 23 or hour < 1: return 1 
     return (hour + 1) // 2 + 1
 
 def map_gender_tuvi(gender_str):
@@ -374,7 +315,6 @@ def extract_tuvi_metadata(thien_ban, dia_ban):
     except: return {}
 
 def generate_tuvi_context_text(thien_ban, dia_ban):
-    # Rút gọn logic tạo text context cho LLM (chỉ lấy điểm chính để tiết kiệm token)
     lines = [f"Đương số: {thien_ban.ten}, Mệnh: {thien_ban.banMenh}, Cục: {thien_ban.tenCuc}"]
     for i in range(1, 13):
         cung = dia_ban.thapNhiCung[i]
@@ -406,7 +346,6 @@ def handle_horoscope(body):
         prompt = get_horoscope_prompt(rag_context, user_context)
         ai_response = call_bedrock_llm(prompt, temperature=0.7)
         
-        # Trả về JSON chứa cả dữ liệu thô (summary) và lời giải (analysis)
         return {
             "summary": summary_data,
             "analysis": ai_response,
@@ -438,18 +377,9 @@ def lambda_handler(event, context):
             ans = handle_numerology(body)
         elif domain == 'horoscope':
             ans = handle_horoscope(body)
-    #mớ cmt này nếu như muốn trả về JSON cho Horoscope (gồm cả summary-tóm tắt cho lá số + analysis từ AI)
-        #     # Horoscope trả về Dict (JSON), các domain khác trả về String
-        #     result_json = handle_horoscope(body)
-        #     return {
-        #         'statusCode': 200,
-        #         'headers': {'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*'},
-        #         'body': json.dumps({'domain': domain, 'result': result_json}, ensure_ascii=False)
-        #     }
         else:
             return {'statusCode': 400, 'body': json.dumps({'error': f'Invalid domain: {domain}'})}
             
-        # Standard Response cho Tarot/Astro/Numero
         return {
             'statusCode': 200, 
             'headers': {
