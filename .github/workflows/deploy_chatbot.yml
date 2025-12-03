@@ -1,0 +1,114 @@
+name: Chatbot Lambda CI/CD
+
+on:
+  push:
+    branches: [ "main" ]
+    paths:
+      - "lambda/chatbot/**"
+      - ".github/workflows/deploy_chatbot.yml"
+  pull_request:
+    paths:
+      - "lambda/chatbot/**"
+      - ".github/workflows/deploy_chatbot.yml"
+
+jobs:
+  # ================= CI (Test) =================
+  test:
+    name: Test Chatbot Lambda
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: lambda/chatbot
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python (3.13)
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install dependencies for Test
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+            pip install pytest
+          fi
+
+      - name: Run tests
+        run: |
+          if [ -d tests ]; then
+            pytest
+          else
+            echo "No tests directory, skipping tests"
+          fi
+
+  # ================= CD (Deploy) =================
+  deploy:
+    name: Deploy Chatbot Lambda
+    needs: test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: lambda/chatbot
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python (3.13)
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install dependencies & Prepare Package
+        run: |
+          # 1. Tạo thư mục chứa gói deploy
+          mkdir -p package
+
+          # 2. Cài đặt PIP
+          python -m pip install --upgrade pip
+          
+          # 3. Tải thư viện (Libraries) vào thư mục 'package'
+          # Dùng flag manylinux để tương thích AWS Lambda
+          if [ -f requirements.txt ]; then
+            pip install \
+              --platform manylinux2014_x86_64 \
+              --implementation cp \
+              --python-version 3.13 \
+              --only-binary=:all: \
+              --upgrade \
+              --target package \
+              -r requirements.txt
+          fi
+          
+          # 4. Chỉ copy file CODE chính vào package
+          cp lambda_function.py package/
+          
+          # Debug: Kiểm tra xem trong package có gì
+          ls -la package/
+
+      - name: Zip Lambda package
+        run: |
+          cd package
+          # Xóa cache để zip nhẹ hơn
+          find . -type d -name "__pycache__" -exec rm -rf {} +
+          
+          # Nén tất cả lại
+          zip -r ../chatbot.zip .
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ap-southeast-1
+
+      - name: Deploy to Lambda
+        run: |
+          aws lambda update-function-code \
+            --function-name sorcererxstreme-chatbot \
+            --zip-file fileb://chatbot.zip
