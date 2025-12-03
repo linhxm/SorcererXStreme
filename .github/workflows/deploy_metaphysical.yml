@@ -1,93 +1,120 @@
-# name: Metaphysical Lambda CI/CD
+name: Metaphysical Lambda CI/CD
 
-# on:
-#   push:
-#     branches: [ "main" ]
-#     paths:
-#       - "lambda/metaphysical/**"
-#       - ".github/workflows/deploy_metaphysical.yml"
-#   pull_request:
-#     paths:
-#       - "lambda/metaphysical/**"
-#       - ".github/workflows/deploy_metaphysical.yml"
+on:
+  push:
+    branches: [ "main" ]
+    paths:
+      - "lambda/metaphysical/**"
+      - ".github/workflows/deploy_metaphysical.yml"
+  pull_request:
+    paths:
+      - "lambda/metaphysical/**"
+      - ".github/workflows/deploy_metaphysical.yml"
 
-# jobs:
-#   # ================= CI =================
-#   test:
-#     name: Test Metaphysical Lambda
-#     runs-on: ubuntu-latest
-#     defaults:
-#       run:
-#         working-directory: lambda/metaphysical
+jobs:
+  # ================= CI (Test) =================
+  test:
+    name: Test Metaphysical Lambda
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: lambda/metaphysical
 
-#     steps:
-#       - name: Checkout code
-#         uses: actions/checkout@v4
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
 
-#       - name: Set up Python (3.10)
-#         uses: actions/setup-python@v5
-#         with:
-#           python-version: "3.10"
+      - name: Set up Python (3.13)
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
 
-#       - name: Install dependencies
-#         run: |
-#           python -m pip install --upgrade pip
-#           if [ -f requirements.txt ]; then
-#             pip install -r requirements.txt
-#           else
-#             echo "No requirements.txt, skip install deps"
-#           fi
+      - name: Install dependencies for Test
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+            pip install pytest boto3
+          fi
 
-#       - name: Run tests
-#         run: |
-#           if [ -d tests ]; then
-#             pytest
-#           else
-#             echo "No tests directory, skipping tests for now"
-#           fi
+      - name: Run tests
+        run: |
+          if [ -d tests ]; then
+            pytest
+          else
+            echo "No tests directory, skipping tests"
+          fi
 
-#   # ================= CD =================
-#   deploy:
-#     name: Deploy Metaphysical Lambda
-#     needs: test
-#     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-#     runs-on: ubuntu-latest
-#     defaults:
-#       run:
-#         working-directory: lambda/metaphysical
+  # ================= CD (Deploy) =================
+  deploy:
+    name: Deploy Metaphysical Lambda
+    needs: test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: lambda/metaphysical
 
-#     steps:
-#       - name: Checkout code
-#         uses: actions/checkout@v4
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
 
-#       - name: Set up Python (3.10)
-#         uses: actions/setup-python@v5
-#         with:
-#           python-version: "3.10"
+      - name: Set up Python (3.13)
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
 
-#       - name: Install dependencies into package folder
-#         run: |
-#           mkdir -p package
-#           python -m pip install --upgrade pip
-#           if [ -f requirements.txt ]; then
-#             pip install -r requirements.txt -t package
-#           fi
-#           cp lambda_function.py package/
+      - name: Install dependencies & Prepare Package
+        run: |
+          # 1. Tạo thư mục package
+          mkdir -p package
 
-#       - name: Zip Lambda package
-#         run: |
-#           cd package
-#           zip -r ../metaphysical.zip .
+          # 2. Cài đặt thư viện vào package
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then
+            pip install \
+              --platform manylinux2014_x86_64 \
+              --implementation cp \
+              --python-version 3.13 \
+              --only-binary=:all: \
+              --upgrade \
+              --target package \
+              -r requirements.txt
+          fi
+          
+          # 3. COPY SOURCE CODE (Phần quan trọng nhất)
+          # Copy file chạy chính
+          cp lambda_function.py package/
+          
+          # Copy các file cấu hình và prompt (thấy trong hình ảnh của bạn)
+          cp constants.py package/
+          cp prompts.py package/
+          
+          # Copy nguyên folder thư viện tử vi (Recursive copy)
+          if [ -d lasotuvi ]; then
+             cp -r lasotuvi package/
+          fi
+          
+          # Debug: In ra để kiểm tra
+          echo "Listing package content:"
+          ls -R package/
 
-#       - name: Configure AWS Credentials
-#         uses: aws-actions/configure-aws-credentials@v2
-#         with:
-#           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-#           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-#           aws-region: ap-southeast-1
+      - name: Zip Lambda package
+        run: |
+          cd package
+          # Xóa file rác __pycache__
+          find . -type d -name "__pycache__" -exec rm -rf {} +
+          zip -r ../metaphysical.zip .
 
-#       - name: Deploy to Lambda
-#         run: |
-#           aws lambda update-function-code \
-#             --function-name sorcererxstreme-metaphysical \
-#             --zip-file fileb://metaphysical.zip
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ap-southeast-1
+
+      - name: Deploy to Lambda
+        run: |
+          aws lambda update-function-code \
+            --function-name sorcererxstreme-metaphysical \
+            --zip-file fileb://metaphysical.zip
