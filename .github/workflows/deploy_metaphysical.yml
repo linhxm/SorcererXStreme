@@ -24,10 +24,11 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Set up Python (3.13)
+      # Cập nhật: Sử dụng Python 3.10
+      - name: Set up Python (3.10)
         uses: actions/setup-python@v5
         with:
-          python-version: "3.13"
+          python-version: "3.10"
 
       - name: Install dependencies for Test
         run: |
@@ -59,50 +60,45 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Set up Python (3.13)
+      # Cập nhật: Sử dụng Python 3.10
+      - name: Set up Python (3.10)
         uses: actions/setup-python@v5
         with:
-          python-version: "3.13"
+          python-version: "3.10"
 
       - name: Install dependencies & Prepare Package
         run: |
-          # 1. Tạo thư mục package
           mkdir -p package
-
-          # 2. Cài đặt thư viện vào package
           python -m pip install --upgrade pip
+          
+          # QUAN TRỌNG: Flag --python-version 3.10 để tải đúng binary
           if [ -f requirements.txt ]; then
             pip install \
               --platform manylinux2014_x86_64 \
               --implementation cp \
-              --python-version 3.13 \
+              --python-version 3.10 \
               --only-binary=:all: \
               --upgrade \
               --target package \
               -r requirements.txt
           fi
           
-          # 3. COPY SOURCE CODE (Phần quan trọng nhất)
-          # Copy file chạy chính
+          # Copy các file code & config
           cp lambda_function.py package/
+          if [ -f constants.py ]; then cp constants.py package/; fi
+          if [ -f prompts.py ]; then cp prompts.py package/; fi
           
-          # Copy các file cấu hình và prompt (thấy trong hình ảnh của bạn)
-          cp constants.py package/
-          cp prompts.py package/
-          
-          # Copy nguyên folder thư viện tử vi (Recursive copy)
+          # Copy folder thư viện tử vi
           if [ -d lasotuvi ]; then
              cp -r lasotuvi package/
           fi
           
-          # Debug: In ra để kiểm tra
           echo "Listing package content:"
           ls -R package/
 
       - name: Zip Lambda package
         run: |
           cd package
-          # Xóa file rác __pycache__
           find . -type d -name "__pycache__" -exec rm -rf {} +
           zip -r ../metaphysical.zip .
 
