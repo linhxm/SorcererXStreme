@@ -6,21 +6,38 @@ import traceback
 from datetime import datetime
 
 # Import thư viện Tử Vi (Giả định đã có trong Layer hoặc package)
-from lasotuvi.App import lapDiaBan
-from lasotuvi.DiaBan import diaBan as DiaBanClass
-from lasotuvi.ThienBan import lapThienBan
+# Nếu chạy local mà không có folder này sẽ lỗi, nhưng trong môi trường Test chúng ta sẽ Mock nó hoặc chấp nhận lỗi import nếu không test sâu vào hàm library.
+try:
+    from lasotuvi.App import lapDiaBan
+    from lasotuvi.DiaBan import diaBan as DiaBanClass
+    from lasotuvi.ThienBan import lapThienBan
+except ImportError:
+    # Fallback giả định để code không crash ngay khi import nếu thiếu thư viện (hữu ích khi chạy test local thiếu lib)
+    print("WARNING: Không tìm thấy thư viện lasotuvi. Các chức năng Tử Vi sẽ không hoạt động.")
+    lapDiaBan = None
+    DiaBanClass = None
+    lapThienBan = None
 
-# IMPORT CÁC CONSTANTS & PROMPTS
-# Lưu ý: LLM_MODEL_ID đã được update thành Nova Pro trong file constants.py
-from constants import (
-    BEDROCK_REGION, LLM_MODEL_ID, DYNAMODB_TABLE_NAME
-)
 from prompts import get_tarot_prompt, get_astrology_prompt, get_numerology_prompt, get_horoscope_prompt
 
+# ==========================================
+# 0. CONSTANTS & CONFIGURATION (Đã gộp vào đây)
+# ==========================================
+BEDROCK_REGION = os.environ.get("BEDROCK_REGION", "us-east-1")
+# Model ID mặc định là Nova Pro như bạn yêu cầu
+LLM_MODEL_ID = os.environ.get("BEDROCK_MODEL_ID", "amazon.nova-pro-v1:0") 
+DYNAMODB_TABLE_NAME = os.environ.get("DYNAMODB_TABLE_NAME", "SorcererXStreme_Metaphysical_Table")
+
 # === KHỞI TẠO CLIENTS ===
-bedrock_client = boto3.client('bedrock-runtime', region_name=BEDROCK_REGION)
-dynamodb = boto3.resource('dynamodb', region_name=BEDROCK_REGION)
-table = dynamodb.Table(DYNAMODB_TABLE_NAME)
+# Lưu ý: Khởi tạo global giúp tận dụng connection reuse trong Lambda
+try:
+    bedrock_client = boto3.client('bedrock-runtime', region_name=BEDROCK_REGION)
+    dynamodb = boto3.resource('dynamodb', region_name=BEDROCK_REGION)
+    table = dynamodb.Table(DYNAMODB_TABLE_NAME)
+except Exception as e:
+    print(f"INIT ERROR: Không thể khởi tạo AWS Clients. {e}")
+    bedrock_client = None
+    table = None
 
 # ==========================================
 # 1. HELPER FUNCTIONS (UTILITIES)
@@ -30,6 +47,7 @@ def get_db_item(category, entity_name):
     """
     Lấy item từ DynamoDB và tự động parse JSON string trong trường 'contexts'.
     """
+    if not table: return {}
     try:
         response = table.get_item(
             Key={
@@ -54,8 +72,10 @@ def get_db_item(category, entity_name):
         return {}
 
 def call_bedrock_llm(prompt, temperature=0.5):
-    """Gửi prompt tới Model (Cấu hình trong constants.py)"""
-    
+    """Gửi prompt tới Model"""
+    if not bedrock_client:
+        return "Lỗi: Kết nối tới Bedrock chưa được thiết lập."
+
     # Cấu trúc Body chuẩn của Amazon Nova Pro
     body = json.dumps({
         "inferenceConfig": {
@@ -75,9 +95,10 @@ def call_bedrock_llm(prompt, temperature=0.5):
 
     try:
         response = bedrock_client.invoke_model(
-            modelId=LLM_MODEL_ID, # <--- SỬ DỤNG BIẾN TỪ CONSTANTS
+            modelId=LLM_MODEL_ID,
             body=body
         )
+        # Đọc stream từ body
         response_body = json.loads(response.get('body').read())
         
         # Parse response của Nova: output -> message -> content -> text
@@ -337,6 +358,9 @@ def handle_horoscope(body):
     gender_input = map_gender_tuvi(gender_str)
     
     try:
+        if lapDiaBan is None:
+            raise ImportError("Thư viện lasotuvi không khả dụng.")
+
         db = lapDiaBan(DiaBanClass, dd, mm, yy, chi_gio, gender_input, duongLich=True, timeZone=7)
         tb = lapThienBan(dd, mm, yy, chi_gio, gender_input, name, db, duongLich=True, timeZone=7)
         
