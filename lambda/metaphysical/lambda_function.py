@@ -25,7 +25,7 @@ from prompts import get_tarot_prompt, get_astrology_prompt, get_numerology_promp
 # ==========================================
 BEDROCK_REGION = os.environ.get("BEDROCK_REGION", "ap-southeast-1")
 # Model ID mặc định là Nova Pro như bạn yêu cầu
-LLM_MODEL_ID = os.environ.get("BEDROCK_MODEL_ID", "amazon.nova-pro-v1:0") 
+LLM_MODEL_ID = os.environ.get("BEDROCK_MODEL_ID", "apac.amazon.nova-pro-v1:0") 
 DYNAMODB_TABLE_NAME = os.environ.get("DYNAMODB_TABLE_NAME", "SorcererXStreme_Metaphysical_Table")
 
 # === KHỞI TẠO CLIENTS ===
