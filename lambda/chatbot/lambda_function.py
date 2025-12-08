@@ -135,82 +135,72 @@ def build_prompt(
     history: List[Dict], 
     question: str
 ) -> Tuple[str, str]:
-    """
-    Tạo Prompt theo cấu trúc Role & Objective chuẩn (Updated Logic)
-    Trả về (System Prompt, User Prompt)
-    """
-
-    # 1. Parse User Data
-    birth_date = user_context.get("birth_date", "Chưa rõ")
-    birth_time = user_context.get("birth_time", "Chưa rõ")
-    birth_place = user_context.get("birth_place", "Chưa rõ")
     
-    # 2. Parse Partner Data
-    # Kiểm tra nếu partner_context có dữ liệu thực sự
-    has_partner = partner_context and (partner_context.get("name") or partner_context.get("birth_date"))
+    # 1. Chuẩn bị dữ liệu Input (Vẫn nạp đủ để AI tính toán, nhưng cấm AI nói ra)
+    u_name = user_context.get("name", "Bạn")
+    u_info = f"Name: {u_name}, {user_context.get('birth_date')}, {user_context.get('birth_time')}, {user_context.get('birth_place')}"
     
-    if has_partner:
-        p_name = partner_context.get("name", "Người ấy")
-        p_date = partner_context.get("birth_date", "?")
-        p_time = partner_context.get("birth_time", "?")
-        partner_info_str = f"Tên: {p_name}, Ngày sinh: {p_date}, Giờ: {p_time}"
-    else:
-        partner_info_str = "Người dùng chưa cung cấp thông tin đối phương (Partner)."
+    # Dù có tên Partner, ta vẫn format string này để AI hiểu ngữ cảnh
+    p_name = partner_context.get("name", "Người ấy") if partner_context else "Không có"
+    p_info = ""
+    if partner_context:
+        p_info = f"Partner Name: {p_name}, {partner_context.get('birth_date')}, {partner_context.get('birth_time')}, {partner_context.get('birth_place')}"
 
-    # 3. Format RAG Data
-    if rag_docs:
-        rag_text = "\n".join([f"- [Tài liệu độ tin cậy {d['score']:.2f}]: {d['content']}" for d in rag_docs])
-    else:
-        rag_text = "Không có dữ liệu tham khảo (RAG) phù hợp hoặc độ tin cậy thấp."
+    rag_text = "\n".join([f"- {d['content']}" for d in rag_docs]) if rag_docs else "Không có dữ liệu RAG."
+    
+    # Lấy lịch sử, user name trong lịch sử cũng sẽ được filter bởi rule bên dưới
+    history_text = "\n".join([f"{h['role'].upper()}: {h['content']}" for h in history[-5:]])
 
-    # 4. Format History (Lấy 5 tin gần nhất)
-    recent_history = history[-5:] if len(history) > 5 else history
-    history_text = "\n".join([f"{h['role'].upper()}: {h['content']}" for h in recent_history])
-
-    # ----------------------------------------
-    # SYSTEM PROMPT: Role, Rules & Logic
-    # ----------------------------------------
+    # ---------------------------------------------------------
+    # 2. SYSTEM PROMPT (CẬP NHẬT: LUẬT GIẤU TÊN PARTNER)
+    # ---------------------------------------------------------
     system_prompt = """
-# ROLE & OBJECTIVE
-Bạn là chuyên gia tư vấn Tử Vi - Chiêm Tinh - Tarot AI của ứng dụng "Lasotuvi". Sứ mệnh của bạn là cung cấp lời khuyên thấu đáo, dựa trên dữ liệu cá nhân hóa, với giọng văn ấm áp, chữa lành nhưng súc tích.
+# ROLE
+Bạn là chuyên gia tổng hợp Huyền học (Tử Vi, Thần Số Học, Chiêm Tinh). 
 
-# CRITICAL RULES (BẮT BUỘC TUÂN THỦ)
-1. **Phạm vi trả lời:** TUYỆT ĐỐI KHÔNG tư vấn y tế (bệnh lý cụ thể), đầu tư tài chính (mua mã nào, con số cụ thể), hoặc pháp luật. Nếu gặp, hãy từ chối khéo léo và hướng người dùng đến chuyên gia thực tế.
-2. **Cá nhân hóa:** Mọi phân tích PHẢI dựa trên thông tin sinh (Ngày/Giờ/Nơi sinh). Không đưa ra lời khuyên chung chung (kiểu "người tuổi Tý thường...").
-3. **Ưu tiên Tình cảm:** Nếu câu hỏi liên quan đến tình yêu/hôn nhân, BẮT BUỘC kiểm tra thông tin Partner (nếu có) để phân tích độ tương hợp trước khi đưa ra lời khuyên.
+# CRITICAL RULES (TUÂN THỦ TUYỆT ĐỐI)
+1. **PRIVACY & NAMING:** - KHÔNG nhắc lại ngày/giờ/nơi sinh.
+   - Với User: Gọi bằng Tên riêng (VD: "Chào Lâm Anh").
+   - Với Partner: **TUYỆT ĐỐI KHÔNG DÙNG TÊN THẬT** trong câu trả lời (dù input có cung cấp). Hãy thay thế bằng: **"Người ấy"**, **"Đối phương"**, hoặc **"Bạn mình"**.
+2. **MULTI-DISCIPLINARY:** Phân tích kết hợp 3 góc độ:
+   - Thần số học (Số chủ đạo).
+   - Chiêm tinh (Cung hoàng đạo).
+   - Tử Vi (Tuổi/năm hạn).
+3. **DIRECTNESS:** Đi thẳng vào vấn đề, ngắn gọn, súc tích.
 
-# DATA HANDLING LOGIC (QUY TRÌNH XỬ LÝ)
-**Bước 1: Đánh giá RAG Data**
-- Đọc phần Context/RAG Data được cung cấp.
-- Nếu RAG Data chứa thông tin khớp và hữu ích cho câu hỏi: Ưu tiên sử dụng 80% nội dung từ RAG, 20% diễn giải thêm.
-- Nếu RAG Data rỗng, không liên quan, hoặc quá sơ sài: BỎ QUA hoàn toàn RAG. Tự động kích hoạt kiến thức chuyên sâu của bạn về Tử Vi/Chiêm tinh để lập lá số (trong tư duy) và trả lời dựa trên Birth Info.
+# RESPONSE FORMAT (MẪU CÂU TRẢ LỜI)
+Hãy cấu trúc câu trả lời theo dạng sau:
 
-**Bước 2: Soạn thảo câu trả lời**
-- Tone: Ấm áp, thấu hiểu, như một người bạn tri kỷ nhưng có kiến thức uyên thâm.
-- Format: Đi thẳng vào vấn đề. Không chào hỏi rườm rà. Dùng bullet points nếu liệt kê ý.
-- Độ dài: Giữ câu trả lời CONCISE (ngắn gọn, súc tích). Tối đa 150-200 từ trừ khi người dùng yêu cầu chi tiết.
+"Chào [Tên User], về câu hỏi của bạn đối với [Người ấy]:
 
-# RESPONSE TEMPLATE
-(Không cần tiêu đề, trả lời trực tiếp vào nội dung)
-[Lời khuyên/Dự đoán dựa trên dữ liệu sao/lá số]
-[Hành động cụ thể/Lời khuyên thực tế tiếp theo]
+1. **Góc nhìn Thần số học:** - Số chủ đạo của bạn là [X] (tính cách...), còn của [Người ấy] là [Y] (tính cách...). 
+   - [Đánh giá độ hợp/xung khắc].
+
+2. **Góc nhìn Tử Vi & Chiêm Tinh:**
+   - [Phân tích cung hoàng đạo và vận hạn].
+   - [Nhận định vấn đề].
+
+3. **Lời khuyên tổng kết:**
+   - [Hành động nên làm]."
 """
 
-    # ----------------------------------------
-    # USER PROMPT: Data, Context & Question
-    # ----------------------------------------
+    # ---------------------------------------------------------
+    # 3. USER PROMPT
+    # ---------------------------------------------------------
     user_prompt = f"""
-# INPUT DATA
-- User Birth Info: Ngày {birth_date}, Giờ {birth_time}, Nơi sinh {birth_place}.
-- Current Partner (nếu có): {partner_info_str}
+[USER DATA]
+{u_info}
 
-# KNOWLEDGE BASE (RAG DATA)
+[PARTNER DATA]
+{p_info}
+
+[CONTEXT/RAG]
 {rag_text}
 
-# HISTORY (CONTEXT)
+[HISTORY]
 {history_text}
 
-# USER QUESTION
+[QUESTION]
 "{question}"
 """
     return system_prompt.strip(), user_prompt.strip()
@@ -311,4 +301,4 @@ def lambda_handler(event, context):
 
     except Exception as e:
         print(f"CRITICAL ERROR: {e}")
-        return {"statusCode": 500, "body": json.dumps({"error": "Internal Server Error"})}
+        return {"statusCode": 500, "body": json.dumps({"error": "Internal Server Error"})}  
