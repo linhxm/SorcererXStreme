@@ -34,9 +34,8 @@ index = pc.Index(host=PINECONE_HOST)
 def get_embedding(text):
     """Gọi Bedrock Cohere để lấy vector (1024 dimensions)"""
     # Cắt ngắn text nếu quá dài (Cohere giới hạn token, mức 2000-4000 ký tự là an toàn)
-    if len(text) > 2000: 
-        text = text[:2000]
-        
+    if len(text) > 4000: 
+        text = text
     body = json.dumps({
         "texts": [text],
         "input_type": "search_document" 
