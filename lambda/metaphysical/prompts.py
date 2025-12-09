@@ -27,7 +27,7 @@ def get_tarot_prompt(feature_type, context_str, user_query, user_context, intent
             {base_instruction}
             
             --- NHIỆM VỤ ---
-            Phân tích trải bài 3 lá (Quá khứ - Hiện tại - Tương lai).
+            Phân tích trải bài 3 lá (Quá khứ - Hiện tại - Tương lai)
             
             --- DỮ LIỆU LÁ BÀI ---
             {context_str}
