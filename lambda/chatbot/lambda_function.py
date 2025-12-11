@@ -98,9 +98,7 @@ def calculate_tuvi(d: int, m: int, y: int, h_str: str, gender: int) -> dict:
             "menh_tai": diaChi[cung_menh.cungSo]['tenChi'],
             "chinh_tinh": ", ".join(chinh_tinh) if chinh_tinh else "Vô Chính Diệu"
         }
-    except Exception as e:
-        print(f"TuVi Logic Error: {e}")
-        return {}
+    except: return {}
 
 # =========================
 # IV. HELPER FUNCTIONS
@@ -111,33 +109,39 @@ def analyze_intent_and_extract(question: str, input_tarot: List[str]) -> dict:
         "explicit_date": None,
         "has_tarot": False,
         "tarot_cards": list(input_tarot) if input_tarot else [],
-        "needs_calculation": True
+        "needs_llm": True # Mặc định là cần AI xử lý
     }
     
+    # 1. Detect Explicit Date
     date_match = re.search(r'\b(\d{1,2})[/-](\d{1,2})[/-](\d{4})\b', question)
     if date_match:
         d, m, y = map(int, [date_match.group(1), date_match.group(2), date_match.group(3)])
         intent["explicit_date"] = (d, m, y)
 
+    # 2. Detect Tarot
     if not intent["tarot_cards"]:
         tarot_keywords = ["Fool", "Magician", "Empress", "Emperor", "Lover", "Chariot", "Strength", "Hermit", "Wheel", "Justice", "Hanged", "Death", "Temperance", "Devil", "Tower", "Star", "Moon", "Sun", "Judgement", "World", "Cup", "Wand", "Sword", "Pentacle"]
         found = [w for w in tarot_keywords if w.lower() in question.lower()]
-        if found:
-            intent["tarot_cards"] = found
+        if found: intent["tarot_cards"] = found
     
-    if intent["tarot_cards"]:
-        intent["has_tarot"] = True
+    if intent["tarot_cards"]: intent["has_tarot"] = True
 
-    meta_keywords = ["tử vi", "chiêm tinh", "thần số", "bói", "tình cảm", "sự nghiệp", "ngày mai", "hôm nay", "tháng này", "năm nay", "hợp", "kỵ", "số", "cung"]
-    is_meta = any(k in question.lower() for k in meta_keywords)
-    if not is_meta and not intent["explicit_date"] and not intent["has_tarot"] and len(question.split()) < 4:
-        intent["needs_calculation"] = False
+    # 3. Detect Chit-chat (CHỈ chặn những từ vô nghĩa hẳn, còn lại cho qua LLM)
+    # Danh sách từ điển xã giao thuần túy
+    chit_chat_phrases = ["hi", "hello", "alo", "xin chào", "chào", "chào bạn", "hola", "bắt đầu", "start"]
+    
+    cleaned_q = question.strip().lower()
+    # Nếu câu hỏi Y HỆT từ xã giao -> False (Trả lời nhanh)
+    # Nếu câu hỏi là "Tôi là ai" (3 từ) -> Không nằm trong list này -> True (Qua LLM)
+    if cleaned_q in chit_chat_phrases:
+        intent["needs_llm"] = False
 
     return intent
 
 def process_subject_data(intent: dict, user_ctx: dict, partner_ctx: dict) -> dict:
     result = {"rag_keywords": [], "prompt_context": "", "user_calculated": {}, "partner_calculated": {}}
 
+    # Nếu User hỏi ngày cụ thể
     if intent["explicit_date"]:
         d, m, y = intent["explicit_date"]
         lp = calculate_numerology(d, m, y)
@@ -145,12 +149,15 @@ def process_subject_data(intent: dict, user_ctx: dict, partner_ctx: dict) -> dic
         result["prompt_context"] += f"- [THÔNG TIN ĐƯỢC HỎI - NGÀY {d}/{m}/{y}]: Số chủ đạo {lp}, Cung {zd}.\n"
         result["rag_keywords"].extend([f"Số chủ đạo {lp}", f"Cung {zd}"])
 
+    # Xử lý Tarot
     if intent["has_tarot"]:
         cards_str = ", ".join(intent["tarot_cards"])
-        result["prompt_context"] += f"- [BÀI TAROT RÚT ĐƯỢC]: {cards_str} (Hãy giải nghĩa dựa trên các lá này).\n"
+        result["prompt_context"] += f"- [BÀI TAROT]: {cards_str}.\n"
         result["rag_keywords"].extend(intent["tarot_cards"])
 
-    if intent["needs_calculation"] and user_ctx.get("birth_date"):
+    # LUÔN TÍNH TOÁN thông tin User/Partner để sẵn sàng cho câu hỏi "Tôi là ai"
+    # User Info
+    if user_ctx.get("birth_date"):
         dmy = normalize_date(user_ctx["birth_date"])
         if dmy:
             d, m, y = dmy
@@ -160,23 +167,26 @@ def process_subject_data(intent: dict, user_ctx: dict, partner_ctx: dict) -> dic
             if user_ctx.get("birth_time"):
                 gender = 1 if user_ctx.get("gender") == "Nam" else -1
                 tv = calculate_tuvi(d, m, y, user_ctx["birth_time"], gender)
-            result["user_calculated"] = {"lp": lp, "zd": zd, "tv": tv}
             
+            # Context string chứa đầy đủ info để trả lời "Tôi là ai"
+            # Thêm trường 'raw_birth' vào context để LLM biết nếu user hỏi
             tv_str = f", Mệnh {tv.get('menh_tai')}" if tv else ""
-            result["prompt_context"] += f"- [USER METADATA - {user_ctx.get('name', 'Bạn')}]: Số chủ đạo {lp}, Cung {zd}{tv_str}.\n"
+            result["prompt_context"] += f"- [USER DATA - {user_ctx.get('name', 'Bạn')}]: Sinh ngày {user_ctx.get('birth_date')}. Số chủ đạo {lp}, Cung {zd}{tv_str}.\n"
             
+            # RAG Keywords: Chỉ thêm nếu KHÔNG hỏi ngày cụ thể và KHÔNG hỏi Tarot
             if not intent["explicit_date"] and not intent["has_tarot"]:
                 result["rag_keywords"].extend([f"Số chủ đạo {lp}", f"Cung {zd}"])
                 if tv: result["rag_keywords"].append(f"Sao {tv.get('chinh_tinh', '')}")
 
-    if intent["needs_calculation"] and partner_ctx.get("birth_date"):
+    # Partner Info
+    if partner_ctx.get("birth_date"):
         dmy = normalize_date(partner_ctx["birth_date"])
         if dmy:
             d, m, y = dmy
             lp = calculate_numerology(d, m, y)
             zd = calculate_zodiac(d, m)
-            result["partner_calculated"] = {"lp": lp, "zd": zd}
-            result["prompt_context"] += f"- [PARTNER METADATA - Người ấy]: Số chủ đạo {lp}, Cung {zd}.\n"
+            # Ẩn tên thật, gọi là Người ấy
+            result["prompt_context"] += f"- [PARTNER DATA - Người ấy]: Số chủ đạo {lp}, Cung {zd}.\n"
             
             if not intent["explicit_date"] and not intent["has_tarot"]:
                 result["rag_keywords"].extend([f"Số chủ đạo {lp}", f"Cung {zd}"])
@@ -195,7 +205,9 @@ def embed_query(text: str) -> List[float]:
     except: return []
 
 def query_pinecone_rag(keywords: List[str]) -> List[str]:
+    # Nếu không có keywords (VD: hỏi "Tôi là ai"), trả về rỗng -> LLM tự xử lý
     if not pc_index or not keywords: return []
+    
     unique_kw = list(set(keywords))
     search_text = " ".join(unique_kw)
     vector = embed_query(search_text)
@@ -204,7 +216,7 @@ def query_pinecone_rag(keywords: List[str]) -> List[str]:
         results = pc_index.query(vector=vector, top_k=3, include_metadata=True)
         docs = []
         for match in results.get('matches', []):
-            if match['score'] < 0.35: continue
+            if match['score'] < 0.35: continue # Ngưỡng lọc
             md = match.get('metadata', {})
             content = md.get('context_str') or md.get('content') or ""
             entity = md.get('entity_name') or ""
@@ -212,9 +224,7 @@ def query_pinecone_rag(keywords: List[str]) -> List[str]:
         return docs
     except: return []
 
-# [IMPORTANT: RE-ADDED FOR TEST COMPATIBILITY]
 def append_message(session_id: str, role: str, content: str):
-    """Ghi tin nhắn vào DynamoDB (Được tách riêng để Test mock)"""
     try:
         ddb_table.put_item(Item={
             "sessionId": session_id,
@@ -240,7 +250,7 @@ def call_bedrock_nova(system: str, user: str) -> str:
         resp = bedrock.invoke_model(modelId=BEDROCK_LLM_MODEL_ID, body=body, contentType="application/json", accept="application/json")
         return json.loads(resp["body"].read())["output"]["message"]["content"][0]["text"]
     except Exception as e:
-        return "Vũ trụ đang tắc nghẽn, vui lòng thử lại."
+        return f"Lỗi kết nối AI: {str(e)}"
 
 # =========================
 # VI. MAIN HANDLER
@@ -262,42 +272,50 @@ def lambda_handler(event, context):
     if not session_id or (not question and not input_cards):
          return {"statusCode": 400, "body": json.dumps({"error": "Missing sessionId or question"})}
 
+    # 1. Phân tích Intent
     intent = analyze_intent_and_extract(question or "", input_cards) 
     
-    if not intent["needs_calculation"]:
-        reply = "Chào bạn, tôi là trợ lý huyền học. Bạn muốn hỏi về Tử vi, Thần số hay Tarot hôm nay?"
+    # 2. Xử lý Chit-chat (Chỉ return ngay nếu thực sự là câu chào vô nghĩa)
+    if not intent["needs_llm"]:
+        reply = "Chào bạn, tôi là trợ lý huyền học. Tôi có thể giúp bạn giải bài Tarot, xem Tử vi, Chiêm tinh học hoặc Thần số học."
         append_message(session_id, "assistant", reply)
         return {"statusCode": 200, "body": json.dumps({"sessionId": session_id, "reply": reply}, ensure_ascii=False)}
 
+    # 3. Tính toán dữ liệu (Luôn tính User/Partner info để đưa vào Context)
     processed_data = process_subject_data(intent, user_ctx, partner_ctx)
+    
+    # 4. RAG (Nếu có keywords)
     rag_docs = query_pinecone_rag(processed_data["rag_keywords"])
     
+    # Chuẩn bị Prompt
     current_date = get_current_date_vn().strftime("%d/%m/%Y")
-    rag_text = "\n".join(rag_docs) if rag_docs else "Không có dữ liệu tra cứu."
+    # QUAN TRỌNG: Nếu RAG rỗng, text sẽ rỗng -> Prompt sẽ hướng dẫn LLM dùng kiến thức ngoài
+    rag_text = "\n".join(rag_docs) if rag_docs else "" 
     history_text = load_history(session_id)
     
     system_prompt = f"""
 # ROLE: AI Huyền Học (SorcererXstreme). Hôm nay: {current_date}.
 
 # STRICT RULES (BẮT BUỘC):
-1. **PRIVACY:**
-   - KHÔNG nhắc lại ngày tháng năm sinh, giờ sinh của User/Partner trong câu trả lời (trừ khi câu hỏi của User chứa ngày đó).
-   - Chỉ sử dụng các thông số đã tính toán (Số chủ đạo, Cung, Sao) để luận giải.
-   - Gọi Partner là "Người ấy", "Đối phương", tuyệt đối KHÔNG dùng tên thật nếu có trong dữ liệu.
+1. **PRIVACY & IDENTITY:**
+   - Mặc định KHÔNG tự ý nhắc lại ngày sinh/nơi sinh của User/Partner.
+   - **NGOẠI LỆ:** Nếu User hỏi về bản thân (VD: "Tôi là ai?", "Tôi sinh năm mấy?", "Thông tin của tôi"), hãy dùng dữ liệu trong phần [CALCULATED CONTEXT] để trả lời xác nhận danh tính.
+   - Luôn gọi Partner là "Người ấy" hoặc "Đối phương".
 
 2. **LOGIC TRẢ LỜI:**
-   - Nếu có [BÀI TAROT]: Chỉ tập trung giải bài, kết nối với câu chuyện của user. KHÔNG tự bịa lá bài nếu không có dữ liệu.
-   - Nếu hỏi về Tương Hợp/Mối quan hệ: **PHẢI TỔNG HỢP** (Combine) thành 1-2 câu nhận định chung, lồng ghép đặc điểm cả hai. KHÔNG liệt kê kiểu "Bạn là A, người ấy là B".
-   - Nếu câu hỏi chung chung (Vd: "Tôi thế nào?"): Kết hợp đa chiều (Thần số + Chiêm tinh + Tử vi).
+   - **Ưu tiên [KNOWLEDGE BASE]:** Nếu có thông tin tra cứu, hãy dùng nó.
+   - **Fallback (Quan trọng):** Nếu [KNOWLEDGE BASE] rỗng hoặc câu hỏi không liên quan đến dữ liệu tra cứu, hãy trả lời dựa trên Kiến thức tổng quát của bạn và [CALCULATED CONTEXT]. ĐỪNG nói "Tôi không có thông tin".
+   - Nếu có [BÀI TAROT]: Chỉ giải bài, không bịa thêm lá khác.
+   - Nếu hỏi Tương Hợp: Tổng hợp thành 1-2 câu súc tích.
 
-3. **TONE:** Ngắn gọn, súc tích, huyền bí nhưng thực tế.
+3. **TONE:** Ngắn gọn, huyền bí, hữu ích.
 """
 
     user_prompt = f"""
 [CALCULATED CONTEXT]
 {processed_data['prompt_context']}
 
-[KNOWLEDGE BASE]
+[KNOWLEDGE BASE (RAG)]
 {rag_text}
 
 [HISTORY]
@@ -307,9 +325,9 @@ def lambda_handler(event, context):
 "{question}"
 """
 
+    # 5. Gọi AI
     reply = call_bedrock_nova(system_prompt, user_prompt)
 
-    # Sử dụng hàm append_message thay vì gọi trực tiếp ddb_table để pass test
     append_message(session_id, "user", question)
     append_message(session_id, "assistant", reply)
 
