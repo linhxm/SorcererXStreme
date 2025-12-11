@@ -1,365 +1,338 @@
-import json
-import boto3
 import os
-import sys
-import traceback
+import json
 import re
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, List, Tuple, Optional
 
-# --- CẤU HÌNH ĐƯỜNG DẪN THƯ VIỆN ---
-# Thêm thư mục hiện tại vào path để import được folder 'lasotuvi' nằm cùng cấp
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+import boto3
+from boto3.dynamodb.conditions import Key
+from pinecone import Pinecone
 
-# --- IMPORT THƯ VIỆN TỬ VI ---
-HAS_TUVI_LIB = False
+# Import thư viện Tử Vi
 try:
-    from lasotuvi import App, DiaBan, ThienBan
+    from lasotuvi import App, DiaBan
     from lasotuvi.AmDuong import diaChi
-    HAS_TUVI_LIB = True
-except ImportError as e:
-    print(f"WARNING: Không load được thư viện Tử Vi. Lỗi: {e}")
+    HAS_TUVI = True
+except ImportError:
+    HAS_TUVI = False
+    print("WARNING: Không tìm thấy thư viện lasotuvi.")
 
-# ==========================================
-# 0. CONFIGURATION & CLIENTS
-# ==========================================
-BEDROCK_REGION = os.environ.get("BEDROCK_REGION", "ap-southeast-1")
-LLM_MODEL_ID = os.environ.get("BEDROCK_MODEL_ID", "apac.amazon.nova-pro-v1:0") 
-DYNAMODB_TABLE_NAME = os.environ.get("DYNAMODB_TABLE_NAME", "SorcererXStreme_KnowledgeBase")
+# =========================
+# I. CONFIGURATION
+# =========================
+DDB_MESSAGE_TABLE = os.environ.get("DDB_MESSAGE_TABLE", "sorcererxstreme-chatMessages")
+BEDROCK_LLM_MODEL_ID = os.environ.get("BEDROCK_LLM_MODEL_ID", "amazon.nova-micro-v1:0")
+BEDROCK_EMBED_MODEL_ID = os.environ.get("BEDROCK_EMBED_MODEL_ID", "cohere.embed-multilingual-v3")
+PINECONE_API_KEY = os.environ.get("PINECONE_API_KEY")
+PINECONE_HOST = os.environ.get("PINECONE_HOST")
 
-try:
-    bedrock_client = boto3.client('bedrock-runtime', region_name=BEDROCK_REGION)
-    dynamodb = boto3.resource('dynamodb', region_name=BEDROCK_REGION)
-    table = dynamodb.Table(DYNAMODB_TABLE_NAME)
-except Exception as e:
-    print(f"INIT ERROR: {e}")
-    bedrock_client = None
-    table = None
+# =========================
+# II. GLOBAL CLIENTS
+# =========================
+dynamodb = boto3.resource("dynamodb")
+ddb_table = dynamodb.Table(DDB_MESSAGE_TABLE)
+bedrock = boto3.client("bedrock-runtime")
 
-# ==========================================
-# 1. HELPER FUNCTIONS (UTILITIES)
-# ==========================================
-
-def get_current_date():
-    """Lấy ngày hiện tại (UTC+7 cho Việt Nam)"""
-    return datetime.utcnow() + timedelta(hours=7)
-
-def parse_date_input(date_input):
-    """
-    Xử lý input linh hoạt:
-    1. Nếu input là text chứa ngày (VD: 'xem ngày 10/10/2025'), trích xuất ngày đó.
-    2. Nếu input là chuỗi ngày (YYYY-MM-DD), parse ra date object.
-    """
-    if not date_input: return None
-    
-    # Regex tìm ngày trong chuỗi văn bản (DD/MM/YYYY hoặc DD-MM-YYYY)
-    match = re.search(r'(\d{1,2})[/-](\d{1,2})[/-](\d{4})', str(date_input))
-    if match:
-        try:
-            d, m, y = map(int, match.groups())
-            return datetime(y, m, d)
-        except ValueError:
-            pass
-            
-    # Fallback cho định dạng chuẩn ISO
+pc_index = None
+if PINECONE_API_KEY and PINECONE_HOST:
     try:
-        return datetime.strptime(str(date_input), "%Y-%m-%d")
+        pc = Pinecone(api_key=PINECONE_API_KEY)
+        pc_index = pc.Index(host=PINECONE_HOST)
+    except Exception as e:
+        print(f"INIT ERROR: Pinecone {e}")
+
+# =========================
+# III. CALCULATION ENGINES
+# =========================
+
+def get_current_date_vn():
+    return datetime.now(timezone(timedelta(hours=7)))
+
+def normalize_date(date_str: str) -> Optional[Tuple[int, int, int]]:
+    try:
+        if "-" in date_str:
+            parts = date_str.split("-")
+            return int(parts[2]), int(parts[1]), int(parts[0])
+        elif "/" in date_str:
+            parts = date_str.split("/")
+            return int(parts[0]), int(parts[1]), int(parts[2])
     except:
         return None
+    return None
 
-def get_knowledge_context(category, entity_name):
-    """
-    Lấy dữ liệu ý nghĩa từ Database (RAG).
-    Thay thế cho việc hardcode dataset_v4.jsonl.
-    """
-    if not table: return ""
-    try:
-        # Chuẩn hóa key
-        entity_key = str(entity_name).strip()
-        response = table.get_item(Key={'category': category, 'entity_name': entity_key})
-        item = response.get('Item')
-        
-        if not item:
-            # Fallback tìm kiếm gần đúng hoặc mapping (nếu cần)
-            return ""
-            
-        contexts = item.get('contexts', {})
-        # Nếu lưu dạng JSON string
-        if isinstance(contexts, str):
-            try: contexts = json.loads(contexts)
-            except: pass
-            
-        # Flatten context thành text để đưa vào Prompt
-        context_text = ""
-        if isinstance(contexts, dict):
-            for k, v in contexts.items():
-                context_text += f"- {k}: {v}\n"
-        else:
-            context_text = str(contexts)
-            
-        return context_text
-    except Exception as e:
-        print(f"DB Error: {e}")
-        return ""
-
-def call_bedrock_llm(system_instruction, user_input, temperature=0.6):
-    """Gửi request tới Bedrock"""
-    if not bedrock_client: return "Lỗi kết nối AI."
-
-    body = json.dumps({
-        "inferenceConfig": {"max_new_tokens": 2000, "temperature": temperature},
-        "system": [{"text": system_instruction}],
-        "messages": [{"role": "user", "content": [{"text": user_input}]}]
-    })
-
-    try:
-        response = bedrock_client.invoke_model(modelId=LLM_MODEL_ID, body=body)
-        response_body = json.loads(response.get('body').read())
-        return response_body['output']['message']['content'][0]['text']
-    except Exception as e:
-        print(f"Bedrock Error: {e}")
-        return "Vũ trụ đang tắc nghẽn, vui lòng thử lại sau."
-
-# ==========================================
-# 2. CALCULATION ENGINES (TÍNH TOÁN LOGIC)
-# ==========================================
-
-# --- Thần Số Học ---
-def calc_numerology_number(dt):
-    """Tính số chủ đạo"""
-    if not dt: return None
-    s = str(dt.day) + str(dt.month) + str(dt.year)
-    total = sum(int(c) for c in s)
+def calculate_numerology(d: int, m: int, y: int) -> str:
+    def sum_digits(n):
+        s = sum(int(digit) for digit in str(n))
+        if s == 11 or s == 22 or s == 33: return s
+        return s if s < 10 else sum_digits(s)
     
-    # Rút gọn (giữ lại 11, 22, 33 nếu muốn, ở đây giữ logic cơ bản 2-11 và 22/4)
-    while total > 11 and total != 22:
-        total = sum(int(c) for c in str(total))
-    
-    if total == 22: return "22"
-    if total == 11: return "11"
-    if total == 10: return "1" # Một số trường phái coi 10 là 1
-    return str(total)
+    total = sum_digits(d) + sum_digits(m) + sum_digits(y)
+    lp = sum_digits(total)
+    if lp == 4 and total == 22: lp = 22
+    return str(lp)
 
-# --- Chiêm Tinh ---
-def calc_zodiac_sign(day, month):
+def calculate_zodiac(d: int, m: int) -> str:
     zodiacs = [
         (1, 20, "Ma Kết"), (2, 19, "Bảo Bình"), (3, 21, "Song Ngư"),
         (4, 20, "Bạch Dương"), (5, 21, "Kim Ngưu"), (6, 22, "Song Tử"),
         (7, 23, "Cự Giải"), (8, 23, "Sư Tử"), (9, 23, "Xử Nữ"),
-        (10, 24, "Thiên Bình"), (11, 23, "Thiên Yết"), (12, 22, "Nhân Mã")
+        (10, 24, "Thiên Bình"), (11, 23, "Bọ Cạp"), (12, 22, "Nhân Mã")
     ]
-    for m, d, sign in zodiacs:
-        if month == m:
-            if day < d: return sign
-            else:
-                # Lấy cung kế tiếp
-                idx = zodiacs.index((m, d, sign)) + 1
-                return zodiacs[idx % 12][2]
+    for month, day, sign in zodiacs:
+        if m == month:
+            return sign if d < day else zodiacs[(zodiacs.index((month, day, sign)) + 1) % 12][2]
     return "Ma Kết"
 
-# --- Tử Vi (Dùng thư viện lasotuvi) ---
-def calc_tuvi_summary(dob, time_str, gender_str, name):
-    if not HAS_TUVI_LIB or not time_str:
-        return None
-    
+def calculate_tuvi(d: int, m: int, y: int, h_str: str, gender: int) -> dict:
+    if not HAS_TUVI or not h_str: return {}
     try:
-        # Parse giờ sinh (HH:MM) thành Chi (1-12)
-        h = int(time_str.split(':')[0])
-        chi_gio = int((h + 1) / 2) % 12
-        if chi_gio == 0: chi_gio = 12
+        hour_val = int(h_str.split(":")[0])
+        gio_chi = int((hour_val + 1) / 2) % 12
+        if gio_chi == 0: gio_chi = 12
         
-        # Gender: 1 Nam, -1 Nữ
-        gender = 1 if gender_str in ['male', 'nam'] else -1
-        
-        # Gọi thư viện tính toán
-        db = App.lapDiaBan(DiaBan.diaBan, dob.day, dob.month, dob.year, chi_gio, gender, True, 7)
-        tb = ThienBan.lapThienBan(dob.day, dob.month, dob.year, chi_gio, gender, name, db, True, 7)
-        
-        # Trích xuất dữ liệu quan trọng để gửi cho AI
-        cung_menh_idx = db.cungMenh
-        cung_menh_data = db.thapNhiCung[cung_menh_idx]
-        chinh_tinh = [s['saoTen'] for s in cung_menh_data.cungSao if s['saoLoai'] == 1]
+        db = App.lapDiaBan(DiaBan.diaBan, d, m, y, gio_chi, gender, True, 7)
+        cung_menh = db.thapNhiCung[db.cungMenh]
+        chinh_tinh = [s['saoTen'] for s in cung_menh.cungSao if s['saoLoai'] == 1]
         
         return {
-            "menh": tb.banMenh,
-            "cuc": tb.tenCuc,
-            "menh_tai_cung": diaChi[cung_menh_data.cungSo]['tenChi'],
+            "menh_tai": diaChi[cung_menh.cungSo]['tenChi'],
             "chinh_tinh": ", ".join(chinh_tinh) if chinh_tinh else "Vô Chính Diệu"
         }
+    except: return {}
+
+# =========================
+# IV. HELPER FUNCTIONS
+# =========================
+
+def analyze_intent_and_extract(question: str, input_tarot: List[str]) -> dict:
+    intent = {
+        "explicit_date": None,
+        "has_tarot": False,
+        "tarot_cards": list(input_tarot) if input_tarot else [],
+        "needs_llm": True # Mặc định là cần AI xử lý
+    }
+    
+    # 1. Detect Explicit Date
+    date_match = re.search(r'\b(\d{1,2})[/-](\d{1,2})[/-](\d{4})\b', question)
+    if date_match:
+        d, m, y = map(int, [date_match.group(1), date_match.group(2), date_match.group(3)])
+        intent["explicit_date"] = (d, m, y)
+
+    # 2. Detect Tarot
+    if not intent["tarot_cards"]:
+        tarot_keywords = ["Fool", "Magician", "Empress", "Emperor", "Lover", "Chariot", "Strength", "Hermit", "Wheel", "Justice", "Hanged", "Death", "Temperance", "Devil", "Tower", "Star", "Moon", "Sun", "Judgement", "World", "Cup", "Wand", "Sword", "Pentacle"]
+        found = [w for w in tarot_keywords if w.lower() in question.lower()]
+        if found: intent["tarot_cards"] = found
+    
+    if intent["tarot_cards"]: intent["has_tarot"] = True
+
+    # 3. Detect Chit-chat (CHỈ chặn những từ vô nghĩa hẳn, còn lại cho qua LLM)
+    # Danh sách từ điển xã giao thuần túy
+    chit_chat_phrases = ["hi", "hello", "alo", "xin chào", "chào", "chào bạn", "hola", "bắt đầu", "start"]
+    
+    cleaned_q = question.strip().lower()
+    # Nếu câu hỏi Y HỆT từ xã giao -> False (Trả lời nhanh)
+    # Nếu câu hỏi là "Tôi là ai" (3 từ) -> Không nằm trong list này -> True (Qua LLM)
+    if cleaned_q in chit_chat_phrases:
+        intent["needs_llm"] = False
+
+    return intent
+
+def process_subject_data(intent: dict, user_ctx: dict, partner_ctx: dict) -> dict:
+    result = {"rag_keywords": [], "prompt_context": "", "user_calculated": {}, "partner_calculated": {}}
+
+    # Nếu User hỏi ngày cụ thể
+    if intent["explicit_date"]:
+        d, m, y = intent["explicit_date"]
+        lp = calculate_numerology(d, m, y)
+        zd = calculate_zodiac(d, m)
+        result["prompt_context"] += f"- [THÔNG TIN ĐƯỢC HỎI - NGÀY {d}/{m}/{y}]: Số chủ đạo {lp}, Cung {zd}.\n"
+        result["rag_keywords"].extend([f"Số chủ đạo {lp}", f"Cung {zd}"])
+
+    # Xử lý Tarot
+    if intent["has_tarot"]:
+        cards_str = ", ".join(intent["tarot_cards"])
+        result["prompt_context"] += f"- [BÀI TAROT]: {cards_str}.\n"
+        result["rag_keywords"].extend(intent["tarot_cards"])
+
+    # LUÔN TÍNH TOÁN thông tin User/Partner để sẵn sàng cho câu hỏi "Tôi là ai"
+    # User Info
+    if user_ctx.get("birth_date"):
+        dmy = normalize_date(user_ctx["birth_date"])
+        if dmy:
+            d, m, y = dmy
+            lp = calculate_numerology(d, m, y)
+            zd = calculate_zodiac(d, m)
+            tv = {}
+            if user_ctx.get("birth_time"):
+                gender = 1 if user_ctx.get("gender") == "Nam" else -1
+                tv = calculate_tuvi(d, m, y, user_ctx["birth_time"], gender)
+            
+            # Context string chứa đầy đủ info để trả lời "Tôi là ai"
+            # Thêm trường 'raw_birth' vào context để LLM biết nếu user hỏi
+            tv_str = f", Mệnh {tv.get('menh_tai')}" if tv else ""
+            result["prompt_context"] += f"- [USER DATA - {user_ctx.get('name', 'Bạn')}]: Sinh ngày {user_ctx.get('birth_date')}. Số chủ đạo {lp}, Cung {zd}{tv_str}.\n"
+            
+            # RAG Keywords: Chỉ thêm nếu KHÔNG hỏi ngày cụ thể và KHÔNG hỏi Tarot
+            if not intent["explicit_date"] and not intent["has_tarot"]:
+                result["rag_keywords"].extend([f"Số chủ đạo {lp}", f"Cung {zd}"])
+                if tv: result["rag_keywords"].append(f"Sao {tv.get('chinh_tinh', '')}")
+
+    # Partner Info
+    if partner_ctx.get("birth_date"):
+        dmy = normalize_date(partner_ctx["birth_date"])
+        if dmy:
+            d, m, y = dmy
+            lp = calculate_numerology(d, m, y)
+            zd = calculate_zodiac(d, m)
+            # Ẩn tên thật, gọi là Người ấy
+            result["prompt_context"] += f"- [PARTNER DATA - Người ấy]: Số chủ đạo {lp}, Cung {zd}.\n"
+            
+            if not intent["explicit_date"] and not intent["has_tarot"]:
+                result["rag_keywords"].extend([f"Số chủ đạo {lp}", f"Cung {zd}"])
+
+    return result
+
+def embed_query(text: str) -> List[float]:
+    if not text: return []
+    try:
+        resp = bedrock.invoke_model(
+            modelId=BEDROCK_EMBED_MODEL_ID,
+            body=json.dumps({"texts": [text[:2000]], "input_type": "search_query"}),
+            contentType="application/json", accept="*/*"
+        )
+        return json.loads(resp["body"].read())["embeddings"][0]
+    except: return []
+
+def query_pinecone_rag(keywords: List[str]) -> List[str]:
+    # Nếu không có keywords (VD: hỏi "Tôi là ai"), trả về rỗng -> LLM tự xử lý
+    if not pc_index or not keywords: return []
+    
+    unique_kw = list(set(keywords))
+    search_text = " ".join(unique_kw)
+    vector = embed_query(search_text)
+    if not vector: return []
+    try:
+        results = pc_index.query(vector=vector, top_k=3, include_metadata=True)
+        docs = []
+        for match in results.get('matches', []):
+            if match['score'] < 0.35: continue # Ngưỡng lọc
+            md = match.get('metadata', {})
+            content = md.get('context_str') or md.get('content') or ""
+            entity = md.get('entity_name') or ""
+            docs.append(f"[{entity}]: {content}")
+        return docs
+    except: return []
+
+def append_message(session_id: str, role: str, content: str):
+    try:
+        ddb_table.put_item(Item={
+            "sessionId": session_id,
+            "timestamp": datetime.utcnow().isoformat() + "Z",
+            "role": role,
+            "content": content,
+        })
+    except: pass
+
+def load_history(session_id: str) -> str:
+    try:
+        items = ddb_table.query(KeyConditionExpression=Key("sessionId").eq(session_id), ScanIndexForward=False, Limit=5).get("Items", [])
+        return "\n".join([f"{h['role'].upper()}: {h['content']}" for h in items[::-1]])
+    except: return ""
+
+def call_bedrock_nova(system: str, user: str) -> str:
+    body = json.dumps({
+        "inferenceConfig": {"max_new_tokens": 1000, "temperature": 0.6},
+        "system": [{"text": system}],
+        "messages": [{"role": "user", "content": [{"text": user}]}]
+    })
+    try:
+        resp = bedrock.invoke_model(modelId=BEDROCK_LLM_MODEL_ID, body=body, contentType="application/json", accept="application/json")
+        return json.loads(resp["body"].read())["output"]["message"]["content"][0]["text"]
     except Exception as e:
-        print(f"TuVi Calc Error: {e}")
-        return None
+        return f"Lỗi kết nối AI: {str(e)}"
 
-# ==========================================
-# 3. LOGIC CONTROLLER
-# ==========================================
-
-def process_request(body):
-    """Xử lý logic trung tâm: Payload -> Calculate -> Context -> Prompt"""
-    
-    # 1. Trích xuất Payload
-    data = body.get('data', {})
-    user_ctx = body.get('user_context', {})
-    partner_ctx = body.get('partner_context', {})
-    
-    session_id = data.get('sessionId')
-    question = data.get('question', '')
-    tarot_cards = data.get('tarot_cards', []) # Danh sách bài Tarot nếu có
-    
-    # 2. Phân tích Intent & Time
-    # Ưu tiên ngày trong câu hỏi (Explicit) hơn ngày sinh trong profile (Implicit)
-    explicit_date = parse_date_input(question)
-    current_date = get_current_date()
-    
-    # Xác định chủ đề (nếu người dùng không chọn feature_type cụ thể)
-    domain_data = {} # Chứa data đã tính toán
-    knowledge_context = [] # Chứa text ý nghĩa từ DB
-    
-    # --- LOGIC NGƯỜI DÙNG (USER) ---
-    user_dob = parse_date_input(user_ctx.get('birth_date'))
-    if user_dob:
-        # Thần số
-        lp = calc_numerology_number(user_dob)
-        domain_data['user_numerology'] = lp
-        knowledge_context.append(f"Kiến thức số chủ đạo {lp}: {get_knowledge_context('numerology_number', f'Số {lp}')}")
-        
-        # Chiêm tinh
-        zodiac = calc_zodiac_sign(user_dob.day, user_dob.month)
-        domain_data['user_zodiac'] = zodiac
-        knowledge_context.append(f"Kiến thức cung {zodiac}: {get_knowledge_context('cung-hoang-dao', zodiac)}")
-        
-        # Tử vi (Chỉ khi có giờ sinh)
-        tv = calc_tuvi_summary(user_dob, user_ctx.get('birth_time'), user_ctx.get('gender'), user_ctx.get('name'))
-        if tv:
-            domain_data['user_tuvi'] = tv
-            # Tử vi phức tạp, context lấy từ kết quả tính toán trực tiếp là chính
-    
-    # --- LOGIC ĐỐI PHƯƠNG (PARTNER - Nếu có) ---
-    partner_dob = parse_date_input(partner_ctx.get('birth_date'))
-    if partner_dob:
-        p_lp = calc_numerology_number(partner_dob)
-        p_zodiac = calc_zodiac_sign(partner_dob.day, partner_dob.month)
-        domain_data['partner_numerology'] = p_lp
-        domain_data['partner_zodiac'] = p_zodiac
-        # Lấy thêm context nếu cần so sánh
-        knowledge_context.append(f"Kiến thức cung đối phương {p_zodiac}: {get_knowledge_context('cung-hoang-dao', p_zodiac)}")
-
-    # --- LOGIC NGÀY CỤ THỂ (EXPLICIT DATE) ---
-    # Nếu câu hỏi hỏi về ngày cụ thể (VD: "Ngày 10/10/2025 thế nào?")
-    if explicit_date:
-        ex_lp = calc_numerology_number(explicit_date)
-        domain_data['explicit_date'] = {
-            "date": explicit_date.strftime("%d/%m/%Y"),
-            "numerology": ex_lp
-        }
-        # Clear bớt context cá nhân nếu câu hỏi chỉ tập trung vào ngày này? 
-        # Tùy logic, nhưng ở đây giữ lại để so sánh độ hợp ngày.
-        knowledge_context.append(f"Kiến thức thần số ngày {ex_lp}: {get_knowledge_context('numerology_number', f'Số {ex_lp}')}")
-
-    # --- LOGIC TAROT ---
-    if tarot_cards:
-        # Chỉ giải khi có bài
-        card_meanings = []
-        for card in tarot_cards:
-            # Giả sử card là string tên bài. Nếu là dict thì cần parse.
-            meaning = get_knowledge_context('tarot_card', card)
-            card_meanings.append(f"Lá bài: {card}\nÝ nghĩa: {meaning}")
-        domain_data['tarot_reading'] = card_meanings
-
-    # ==========================================
-    # 4. PROMPT ENGINEERING (PRIVACY & LOGIC)
-    # ==========================================
-    
-    # Xây dựng Context String an toàn (Không lộ PII)
-    safe_context_str = f"Thời điểm hiện tại: {current_date.strftime('%d/%m/%Y')}\n"
-    
-    # Thông tin User (Đã ẩn ngày sinh)
-    if 'user_numerology' in domain_data:
-        safe_context_str += f"- USER (Người hỏi): Số chủ đạo {domain_data['user_numerology']}, Cung {domain_data['user_zodiac']}"
-        if 'user_tuvi' in domain_data:
-            tv = domain_data['user_tuvi']
-            safe_context_str += f", Mệnh {tv['menh']}, Cục {tv['cuc']}, Chính tinh {tv['chinh_tinh']} tại {tv['menh_tai_cung']}"
-        safe_context_str += ".\n"
-        
-    # Thông tin Partner (Đã ẩn ngày sinh & Tên)
-    if 'partner_numerology' in domain_data:
-        safe_context_str += f"- PARTNER (Người ấy/Đối phương): Số chủ đạo {domain_data['partner_numerology']}, Cung {domain_data['partner_zodiac']}.\n"
-        
-    # Thông tin ngày được hỏi
-    if 'explicit_date' in domain_data:
-        ed = domain_data['explicit_date']
-        safe_context_str += f"- NGÀY ĐƯỢC HỎI ({ed['date']}): Mang năng lượng số {ed['numerology']}.\n"
-        
-    # Thông tin Tarot
-    if 'tarot_reading' in domain_data:
-        safe_context_str += "\n--- TRẢI BÀI TAROT ---\n" + "\n".join(domain_data['tarot_reading']) + "\n"
-
-    # Kiến thức bổ trợ (RAG)
-    rag_str = "\n".join(knowledge_context)
-
-    # SYSTEM PROMPT
-    system_instruction = """
-    Bạn là AI Huyền Học (SorcererXstreme), chuyên gia về Tử Vi, Thần Số, Chiêm Tinh và Tarot.
-    
-    QUY TẮC BẢO MẬT & XỬ LÝ (TUÂN THỦ TUYỆT ĐỐI):
-    1. **Bảo mật PII:** KHÔNG BAO GIỜ hiển thị ngày sinh, giờ sinh, nơi sinh cụ thể của User hoặc Partner trong câu trả lời, trừ khi User hỏi đích danh (VD: "Ngày sinh của tôi là số mấy?"). Hãy dùng các dữ liệu đã tính toán (Cung, Số chủ đạo...) để luận giải.
-    2. **Xưng hô:** Gọi Partner là "Người ấy", "Đối phương" hoặc "Bạn đời". Không dùng tên riêng nếu không cần thiết.
-    3. **Ưu tiên dữ liệu:** - Nếu có bài Tarot: Ưu tiên giải bài dựa trên câu hỏi.
-       - Nếu câu hỏi về ngày cụ thể: Phân tích năng lượng ngày đó dựa trên tính toán đã cung cấp.
-       - Nếu câu hỏi chung (VD: "Tôi thế nào?"): Tổng hợp từ Tử vi, Chiêm tinh, Thần số (nếu có dữ liệu) để đưa ra bức tranh đa chiều.
-    4. **Phong cách:** Huyền bí, sâu sắc, nhưng thực tế và đưa ra lời khuyên cụ thể.
-    """
-
-    user_prompt = f"""
-    DỮ LIỆU TÍNH TOÁN & TRA CỨU:
-    {safe_context_str}
-    
-    THÔNG TIN BỔ TRỢ TỪ SÁCH (RAG):
-    {rag_str}
-    
-    CÂU HỎI CỦA NGƯỜI DÙNG:
-    "{question}"
-    
-    Hãy trả lời câu hỏi trên dựa vào các dữ liệu đã cung cấp.
-    """
-
-    # Gọi AI
-    ai_response = call_bedrock_llm(system_instruction, user_prompt)
-    
-    return ai_response
-
-# ==========================================
-# 5. LAMBDA HANDLER
-# ==========================================
+# =========================
+# VI. MAIN HANDLER
+# =========================
 
 def lambda_handler(event, context):
     try:
-        # Parse Body
-        body = event.get('body', event)
-        if isinstance(body, str):
-            body = json.loads(body)
-            
-        print("DEBUG Payload:", json.dumps(body, ensure_ascii=False))
+        body = json.loads(event.get("body", "{}")) if isinstance(event.get("body"), str) else event
+    except:
+        return {"statusCode": 400, "body": "Invalid JSON Body"}
 
-        # Xử lý chính
-        answer = process_request(body)
-        
-        # Format Response
-        return {
-            'statusCode': 200,
-            'headers': {
-                'Content-Type': 'application/json',
-                'Access-Control-Allow-Origin': '*'
-            },
-            'body': json.dumps({
-                'sessionId': body.get('data', {}).get('sessionId'),
-                'reply': answer
-            }, ensure_ascii=False)
-        }
+    data = body.get("data", {})
+    user_ctx = body.get("user_context", {})
+    partner_ctx = body.get("partner_context", {})
+    session_id = data.get("sessionId")
+    question = data.get("question")
+    input_cards = data.get("tarot_cards", [])
 
-    except Exception as e:
-        print(f"CRITICAL ERROR: {str(e)}")
-        traceback.print_exc()
-        return {
-            'statusCode': 500,
-            'body': json.dumps({'error': 'Lỗi hệ thống', 'details': str(e)})
-        }
+    if not session_id or (not question and not input_cards):
+         return {"statusCode": 400, "body": json.dumps({"error": "Missing sessionId or question"})}
+
+    # 1. Phân tích Intent
+    intent = analyze_intent_and_extract(question or "", input_cards) 
+    
+    # 2. Xử lý Chit-chat (Chỉ return ngay nếu thực sự là câu chào vô nghĩa)
+    if not intent["needs_llm"]:
+        reply = "Chào bạn, tôi là trợ lý huyền học. Tôi có thể giúp bạn giải bài Tarot, xem Tử vi, Chiêm tinh học hoặc Thần số học."
+        append_message(session_id, "assistant", reply)
+        return {"statusCode": 200, "body": json.dumps({"sessionId": session_id, "reply": reply}, ensure_ascii=False)}
+
+    # 3. Tính toán dữ liệu (Luôn tính User/Partner info để đưa vào Context)
+    processed_data = process_subject_data(intent, user_ctx, partner_ctx)
+    
+    # 4. RAG (Nếu có keywords)
+    rag_docs = query_pinecone_rag(processed_data["rag_keywords"])
+    
+    # Chuẩn bị Prompt
+    current_date = get_current_date_vn().strftime("%d/%m/%Y")
+    # QUAN TRỌNG: Nếu RAG rỗng, text sẽ rỗng -> Prompt sẽ hướng dẫn LLM dùng kiến thức ngoài
+    rag_text = "\n".join(rag_docs) if rag_docs else "" 
+    history_text = load_history(session_id)
+    
+    system_prompt = f"""
+# ROLE: AI Huyền Học (SorcererXstreme). Hôm nay: {current_date}.
+
+# STRICT RULES (BẮT BUỘC):
+1. **PRIVACY & IDENTITY:**
+   - Mặc định KHÔNG tự ý nhắc lại ngày sinh/nơi sinh của User/Partner.
+   - **NGOẠI LỆ:** Nếu User hỏi về bản thân (VD: "Tôi là ai?", "Tôi sinh năm mấy?", "Thông tin của tôi"), hãy dùng dữ liệu trong phần [CALCULATED CONTEXT] để trả lời xác nhận danh tính.
+   - Luôn gọi Partner là "Người ấy" hoặc "Đối phương".
+
+2. **LOGIC TRẢ LỜI:**
+   - **Ưu tiên [KNOWLEDGE BASE]:** Nếu có thông tin tra cứu, hãy dùng nó.
+   - **Fallback (Quan trọng):** Nếu [KNOWLEDGE BASE] rỗng hoặc câu hỏi không liên quan đến dữ liệu tra cứu, hãy trả lời dựa trên Kiến thức tổng quát của bạn và [CALCULATED CONTEXT]. ĐỪNG nói "Tôi không có thông tin".
+   - Nếu có [BÀI TAROT]: Chỉ giải bài, không bịa thêm lá khác.
+   - Nếu hỏi Tương Hợp: Tổng hợp thành 1-2 câu súc tích.
+
+3. **TONE:** Ngắn gọn, huyền bí, hữu ích.
+"""
+
+    user_prompt = f"""
+[CALCULATED CONTEXT]
+{processed_data['prompt_context']}
+
+[KNOWLEDGE BASE (RAG)]
+{rag_text}
+
+[HISTORY]
+{history_text}
+
+[USER QUESTION]
+"{question}"
+"""
+
+    # 5. Gọi AI
+    reply = call_bedrock_nova(system_prompt, user_prompt)
+
+    append_message(session_id, "user", question)
+    append_message(session_id, "assistant", reply)
+
+    return {
+        "statusCode": 200,
+        "headers": {"Content-Type": "application/json", "Access-Control-Allow-Origin": "*"},
+        "body": json.dumps({"sessionId": session_id, "reply": reply}, ensure_ascii=False)
+    }
