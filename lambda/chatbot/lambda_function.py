@@ -8,7 +8,7 @@ import boto3
 from boto3.dynamodb.conditions import Key
 from pinecone import Pinecone
 
-# Import thư viện Tử Vi (Giả định folder lasotuvi nằm cùng cấp)
+# Import thư viện Tử Vi
 try:
     from lasotuvi import App, DiaBan
     from lasotuvi.AmDuong import diaChi
@@ -42,16 +42,14 @@ if PINECONE_API_KEY and PINECONE_HOST:
         print(f"INIT ERROR: Pinecone {e}")
 
 # =========================
-# III. CALCULATION ENGINES (CORE LOGIC)
+# III. CALCULATION ENGINES
 # =========================
 
 def get_current_date_vn():
     return datetime.now(timezone(timedelta(hours=7)))
 
 def normalize_date(date_str: str) -> Optional[Tuple[int, int, int]]:
-    """Chuyển đổi các định dạng ngày về d, m, y"""
     try:
-        # Hỗ trợ DD/MM/YYYY hoặc YYYY-MM-DD
         if "-" in date_str:
             parts = date_str.split("-")
             return int(parts[2]), int(parts[1]), int(parts[0])
@@ -63,7 +61,6 @@ def normalize_date(date_str: str) -> Optional[Tuple[int, int, int]]:
     return None
 
 def calculate_numerology(d: int, m: int, y: int) -> str:
-    """Tính số chủ đạo (Life Path Number)"""
     def sum_digits(n):
         s = sum(int(digit) for digit in str(n))
         if s == 11 or s == 22 or s == 33: return s
@@ -75,7 +72,6 @@ def calculate_numerology(d: int, m: int, y: int) -> str:
     return str(lp)
 
 def calculate_zodiac(d: int, m: int) -> str:
-    """Tính cung hoàng đạo"""
     zodiacs = [
         (1, 20, "Ma Kết"), (2, 19, "Bảo Bình"), (3, 21, "Song Ngư"),
         (4, 20, "Bạch Dương"), (5, 21, "Kim Ngưu"), (6, 22, "Song Tử"),
@@ -88,15 +84,12 @@ def calculate_zodiac(d: int, m: int) -> str:
     return "Ma Kết"
 
 def calculate_tuvi(d: int, m: int, y: int, h_str: str, gender: int) -> dict:
-    """Tính tử vi: Mệnh, Chính tinh. Gender: 1 (Nam), -1 (Nữ)"""
     if not HAS_TUVI or not h_str: return {}
     try:
-        # Parse giờ (HH:MM) ra chi giờ (1=Tý... 12=Hợi)
         hour_val = int(h_str.split(":")[0])
         gio_chi = int((hour_val + 1) / 2) % 12
         if gio_chi == 0: gio_chi = 12
         
-        # Gọi thư viện lasotuvi
         db = App.lapDiaBan(DiaBan.diaBan, d, m, y, gio_chi, gender, True, 7)
         cung_menh = db.thapNhiCung[db.cungMenh]
         chinh_tinh = [s['saoTen'] for s in cung_menh.cungSao if s['saoLoai'] == 1]
@@ -110,27 +103,22 @@ def calculate_tuvi(d: int, m: int, y: int, h_str: str, gender: int) -> dict:
         return {}
 
 # =========================
-# IV. INTELLIGENT HANDLERS
+# IV. HELPER FUNCTIONS
 # =========================
 
 def analyze_intent_and_extract(question: str, input_tarot: List[str]) -> dict:
-    """
-    Phân tích câu hỏi để tìm: Ngày tháng cụ thể, Tarot, hoặc câu hỏi chung.
-    """
     intent = {
-        "explicit_date": None, # Ngày được nhắc đến trong câu hỏi
+        "explicit_date": None,
         "has_tarot": False,
-        "tarot_cards": list(input_cards) if input_cards else [], # input_cards từ global scope (fix later) -> Pass as arg
+        "tarot_cards": list(input_tarot) if input_tarot else [],
         "needs_calculation": True
     }
     
-    # 1. Tìm ngày tháng trong câu hỏi (Explicit Date)
     date_match = re.search(r'\b(\d{1,2})[/-](\d{1,2})[/-](\d{4})\b', question)
     if date_match:
         d, m, y = map(int, [date_match.group(1), date_match.group(2), date_match.group(3)])
         intent["explicit_date"] = (d, m, y)
 
-    # 2. Tìm bài Tarot trong câu hỏi (nếu chưa có trong input payload)
     if not intent["tarot_cards"]:
         tarot_keywords = ["Fool", "Magician", "Empress", "Emperor", "Lover", "Chariot", "Strength", "Hermit", "Wheel", "Justice", "Hanged", "Death", "Temperance", "Devil", "Tower", "Star", "Moon", "Sun", "Judgement", "World", "Cup", "Wand", "Sword", "Pentacle"]
         found = [w for w in tarot_keywords if w.lower() in question.lower()]
@@ -140,8 +128,6 @@ def analyze_intent_and_extract(question: str, input_tarot: List[str]) -> dict:
     if intent["tarot_cards"]:
         intent["has_tarot"] = True
 
-    # 3. Detect Chit-chat (Không cần tính toán)
-    # Nếu câu hỏi quá ngắn và không có keyword huyền học -> Chit chat
     meta_keywords = ["tử vi", "chiêm tinh", "thần số", "bói", "tình cảm", "sự nghiệp", "ngày mai", "hôm nay", "tháng này", "năm nay", "hợp", "kỵ", "số", "cung"]
     is_meta = any(k in question.lower() for k in meta_keywords)
     if not is_meta and not intent["explicit_date"] and not intent["has_tarot"] and len(question.split()) < 4:
@@ -150,61 +136,39 @@ def analyze_intent_and_extract(question: str, input_tarot: List[str]) -> dict:
     return intent
 
 def process_subject_data(intent: dict, user_ctx: dict, partner_ctx: dict) -> dict:
-    """
-    Xử lý logic ưu tiên: Explicit Query > Payload Data
-    """
-    result = {
-        "rag_keywords": [],
-        "prompt_context": "",
-        "user_calculated": {},
-        "partner_calculated": {}
-    }
+    result = {"rag_keywords": [], "prompt_context": "", "user_calculated": {}, "partner_calculated": {}}
 
-    # 1. Xử lý Explicit Date (User hỏi về ngày cụ thể: "10/10/2000 là số mấy?")
-    # Yêu cầu số 3 & 4: Nếu hỏi ngày cụ thể, hiển thị thông tin ngày đó.
     if intent["explicit_date"]:
         d, m, y = intent["explicit_date"]
         lp = calculate_numerology(d, m, y)
         zd = calculate_zodiac(d, m)
         result["prompt_context"] += f"- [THÔNG TIN ĐƯỢC HỎI - NGÀY {d}/{m}/{y}]: Số chủ đạo {lp}, Cung {zd}.\n"
         result["rag_keywords"].extend([f"Số chủ đạo {lp}", f"Cung {zd}"])
-        # Khi hỏi ngày cụ thể, ta ít quan tâm payload user trừ khi câu hỏi liên kết (vd: "Ngày X có hợp tôi không")
-        # Nhưng để an toàn, vẫn tính toán ngầm user payload bên dưới nhưng không cho vào RAG chính.
 
-    # 2. Xử lý Tarot (Yêu cầu số 6 & 7)
     if intent["has_tarot"]:
         cards_str = ", ".join(intent["tarot_cards"])
         result["prompt_context"] += f"- [BÀI TAROT RÚT ĐƯỢC]: {cards_str} (Hãy giải nghĩa dựa trên các lá này).\n"
         result["rag_keywords"].extend(intent["tarot_cards"])
 
-    # 3. Xử lý User Payload (Yêu cầu số 3: Privacy - Chỉ hiển thị metadata)
-    # Chỉ tính toán nếu cần thiết (không phải chit-chat)
     if intent["needs_calculation"] and user_ctx.get("birth_date"):
         dmy = normalize_date(user_ctx["birth_date"])
         if dmy:
             d, m, y = dmy
             lp = calculate_numerology(d, m, y)
             zd = calculate_zodiac(d, m)
-            
-            # Tử vi (Chỉ tính nếu có giờ)
             tv = {}
             if user_ctx.get("birth_time"):
                 gender = 1 if user_ctx.get("gender") == "Nam" else -1
                 tv = calculate_tuvi(d, m, y, user_ctx["birth_time"], gender)
-            
             result["user_calculated"] = {"lp": lp, "zd": zd, "tv": tv}
             
-            # Thêm vào context prompt (Ẩn ngày sinh, chỉ hiện kết quả)
             tv_str = f", Mệnh {tv.get('menh_tai')}" if tv else ""
             result["prompt_context"] += f"- [USER METADATA - {user_ctx.get('name', 'Bạn')}]: Số chủ đạo {lp}, Cung {zd}{tv_str}.\n"
             
-            # Chỉ thêm vào RAG keywords nếu câu hỏi KHÔNG phải là hỏi ngày cụ thể
-            # (Tránh nhiễu: Hỏi ngày 10/10 thì đừng search số chủ đạo của user)
             if not intent["explicit_date"] and not intent["has_tarot"]:
                 result["rag_keywords"].extend([f"Số chủ đạo {lp}", f"Cung {zd}"])
                 if tv: result["rag_keywords"].append(f"Sao {tv.get('chinh_tinh', '')}")
 
-    # 4. Xử lý Partner Payload (Yêu cầu số 5: Privacy - Xưng hô 'Người ấy')
     if intent["needs_calculation"] and partner_ctx.get("birth_date"):
         dmy = normalize_date(partner_ctx["birth_date"])
         if dmy:
@@ -212,18 +176,12 @@ def process_subject_data(intent: dict, user_ctx: dict, partner_ctx: dict) -> dic
             lp = calculate_numerology(d, m, y)
             zd = calculate_zodiac(d, m)
             result["partner_calculated"] = {"lp": lp, "zd": zd}
-            
             result["prompt_context"] += f"- [PARTNER METADATA - Người ấy]: Số chủ đạo {lp}, Cung {zd}.\n"
             
-            # Thêm RAG nếu câu hỏi có nhắc đến partner
             if not intent["explicit_date"] and not intent["has_tarot"]:
                 result["rag_keywords"].extend([f"Số chủ đạo {lp}", f"Cung {zd}"])
 
     return result
-
-# =========================
-# V. RAG & LLM
-# =========================
 
 def embed_query(text: str) -> List[float]:
     if not text: return []
@@ -237,15 +195,11 @@ def embed_query(text: str) -> List[float]:
     except: return []
 
 def query_pinecone_rag(keywords: List[str]) -> List[str]:
-    # Yêu cầu số 1: Chỉ search khi có keywords
     if not pc_index or not keywords: return []
-    
-    # Lọc trùng và search
     unique_kw = list(set(keywords))
     search_text = " ".join(unique_kw)
     vector = embed_query(search_text)
     if not vector: return []
-    
     try:
         results = pc_index.query(vector=vector, top_k=3, include_metadata=True)
         docs = []
@@ -257,6 +211,18 @@ def query_pinecone_rag(keywords: List[str]) -> List[str]:
             docs.append(f"[{entity}]: {content}")
         return docs
     except: return []
+
+# [IMPORTANT: RE-ADDED FOR TEST COMPATIBILITY]
+def append_message(session_id: str, role: str, content: str):
+    """Ghi tin nhắn vào DynamoDB (Được tách riêng để Test mock)"""
+    try:
+        ddb_table.put_item(Item={
+            "sessionId": session_id,
+            "timestamp": datetime.utcnow().isoformat() + "Z",
+            "role": role,
+            "content": content,
+        })
+    except: pass
 
 def load_history(session_id: str) -> str:
     try:
@@ -281,7 +247,6 @@ def call_bedrock_nova(system: str, user: str) -> str:
 # =========================
 
 def lambda_handler(event, context):
-    # 1. Validate Input (Strict)
     try:
         body = json.loads(event.get("body", "{}")) if isinstance(event.get("body"), str) else event
     except:
@@ -297,26 +262,16 @@ def lambda_handler(event, context):
     if not session_id or (not question and not input_cards):
          return {"statusCode": 400, "body": json.dumps({"error": "Missing sessionId or question"})}
 
-    # 2. Analyze & Calculate
-    # Truyền input_cards vào hàm analyze
     intent = analyze_intent_and_extract(question or "", input_cards) 
     
-    # Nếu là chit-chat (không cần tính toán, không RAG)
     if not intent["needs_calculation"]:
         reply = "Chào bạn, tôi là trợ lý huyền học. Bạn muốn hỏi về Tử vi, Thần số hay Tarot hôm nay?"
-        # Save & Return nhanh
-        try: ddb_table.put_item(Item={"sessionId": session_id, "timestamp": datetime.utcnow().isoformat()+"Z", "role": "assistant", "content": reply})
-        except: pass
+        append_message(session_id, "assistant", reply)
         return {"statusCode": 200, "body": json.dumps({"sessionId": session_id, "reply": reply}, ensure_ascii=False)}
 
-    # Tính toán số liệu & Chuẩn bị RAG keywords
-    # Hàm này đã handle logic Explicit > Payload và Privacy
     processed_data = process_subject_data(intent, user_ctx, partner_ctx)
-    
-    # 3. RAG Search (Chỉ search những keyword cần thiết)
     rag_docs = query_pinecone_rag(processed_data["rag_keywords"])
     
-    # 4. Build Prompt (Strict Requirements)
     current_date = get_current_date_vn().strftime("%d/%m/%Y")
     rag_text = "\n".join(rag_docs) if rag_docs else "Không có dữ liệu tra cứu."
     history_text = load_history(session_id)
@@ -352,14 +307,11 @@ def lambda_handler(event, context):
 "{question}"
 """
 
-    # 5. Call AI
     reply = call_bedrock_nova(system_prompt, user_prompt)
 
-    # 6. Save History
-    try:
-        ddb_table.put_item(Item={"sessionId": session_id, "timestamp": datetime.utcnow().isoformat()+"Z", "role": "user", "content": question})
-        ddb_table.put_item(Item={"sessionId": session_id, "timestamp": datetime.utcnow().isoformat()+"Z", "role": "assistant", "content": reply})
-    except: pass
+    # Sử dụng hàm append_message thay vì gọi trực tiếp ddb_table để pass test
+    append_message(session_id, "user", question)
+    append_message(session_id, "assistant", reply)
 
     return {
         "statusCode": 200,
