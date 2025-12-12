@@ -9,6 +9,7 @@ The project operates on a Serverless Architecture using AWS Lambda functions, tr
 ### Repository Structure
 This project follows a Monorepo pattern, housing three distinct microservices triggered by specific paths.
 
+```bash
 SorcererXStreme/
 ├── .github/workflows/           # CI/CD Pipelines
 │   ├── deploy_chatbot.yml       # Deploy Chatbot Service
@@ -28,7 +29,7 @@ SorcererXStreme/
 │       ├── prompts.py           # AI Prompts (Tarot, Astrology, Tu Vi)
 │       ├── requirements.txt
 │       └── tests/
-
+```
 ---
 
 ## Services Overview
